@@ -20,8 +20,13 @@ final class ServerModel: ObservableObject {
     @Published var commandOutput = ""
     @Published var backup: BackupResponse?
     @Published var metrics: MetricsResponse?
+    @Published var serverIcon: NSImage?
+    @Published var fullSessionLog = ""
+    @Published var showFullLog = false
+    @Published var loadingFullLog = false
     let serverID: String
     private let cli: URL
+    private let runtimeRoot: String
     private var timer: Timer?
 
     init() {
@@ -29,6 +34,8 @@ final class ServerModel: ObservableObject {
         let root = (try? String(contentsOf: resources.appendingPathComponent("mc-config.path"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
         cli = URL(fileURLWithPath: root).appendingPathComponent("mc")
         serverID = (try? String(contentsOf: resources.appendingPathComponent("server-id.txt"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? "chocolate-edition"
+        runtimeRoot = (try? String(contentsOf: resources.appendingPathComponent("runtime-root.path"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? (NSHomeDirectory() + "/MinecraftServerRuntime")
+        serverIcon = NSImage(contentsOf: URL(fileURLWithPath: runtimeRoot).appendingPathComponent(serverID + "/server/server-icon.png"))
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in Task { @MainActor in self?.refresh() } }
     }
@@ -39,8 +46,7 @@ final class ServerModel: ObservableObject {
             self.message = self.running ? "Servidor listo" : "Servidor apagado"
             if self.running { self.refreshPlayers() } else { self.players = []; self.rconLatency = nil }
         }
-        let log = NSHomeDirectory() + "/MinecraftServerRuntime/" + serverID + "/logs/console.log"
-        executeExternal("/usr/bin/tail", ["-n", "16", log]) { result in self.console = result.output.isEmpty ? "Aún no hay salida de consola." : result.output }
+        executeExternal("/usr/bin/tail", ["-n", "16", logURL.path]) { result in self.console = result.output.isEmpty ? "Aún no hay salida de consola." : result.output }
         execute(["backup-status", serverID, "--json"]) { result in
             guard let data = result.output.data(using: .utf8) else { return }
             self.backup = try? JSONDecoder().decode(BackupResponse.self, from: data)
@@ -78,10 +84,19 @@ final class ServerModel: ObservableObject {
             self.commandOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines); self.refresh()
         }
     }
-    func openLog() {
-        let log = NSHomeDirectory() + "/MinecraftServerRuntime/" + serverID + "/logs/console.log"
-        executeExternal("/usr/bin/open", [log]) { _ in }
+    func clearRecentConsole() { console = "" }
+    func loadFullSessionLog() {
+        guard !loadingFullLog else { return }; loadingFullLog = true
+        let log = logURL; let offsetFile = URL(fileURLWithPath: runtimeRoot).appendingPathComponent(serverID + "/state/start-log-offset")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = (try? Data(contentsOf: log)) ?? Data()
+            let offset = Int((try? String(contentsOf: offsetFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? "0") ?? 0
+            let session = data.dropFirst(min(max(offset, 0), data.count))
+            let output = String(data: session, encoding: .utf8) ?? "No fue posible leer el log de sesión."
+            DispatchQueue.main.async { self.fullSessionLog = output; self.loadingFullLog = false; self.showFullLog = true }
+        }
     }
+    private var logURL: URL { URL(fileURLWithPath: runtimeRoot).appendingPathComponent(serverID + "/logs/console.log") }
     private func execute(_ arguments: [String], completion: @escaping (CommandResult) -> Void) { executeExternal(cli.path, arguments, completion: completion) }
     private func executeExternal(_ executable: String, _ arguments: [String], completion: @escaping (CommandResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -128,6 +143,29 @@ struct PlayerCard: View {
     }
 }
 
+struct FullLogView: View {
+    let content: String
+    let dismiss: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("LOG COMPLETO DE LA ÚLTIMA SESIÓN", systemImage: "doc.text.magnifyingglass")
+                    .font(.system(size: 19, weight: .bold, design: .monospaced)).foregroundStyle(.cyan)
+                Spacer(); Button("Cerrar", action: dismiss).buttonStyle(.borderedProminent)
+            }
+            Text("Desde el último encendido registrado hasta el final del archivo actual.")
+                .font(.system(size: 14)).foregroundStyle(.secondary)
+            ScrollView {
+                Text(content.isEmpty ? "No hay contenido de log para esta sesión." : content)
+                    .font(.system(size: 14, design: .monospaced)).foregroundStyle(.mint)
+                    .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+            }
+            .padding(14).background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .padding(26).frame(minWidth: 900, minHeight: 680).background(Color(red: 0.025, green: 0.045, blue: 0.06))
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = ServerModel()
     @State private var showCommandConfirmation = false
@@ -141,7 +179,7 @@ struct ContentView: View {
             ScrollView {
                 VStack(spacing: 25) {
                     HStack(spacing: 18) {
-                        Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 84, height: 84).clipShape(RoundedRectangle(cornerRadius: 19))
+                        Image(nsImage: model.serverIcon ?? NSApp.applicationIconImage).resizable().interpolation(.none).frame(width: 84, height: 84).clipShape(RoundedRectangle(cornerRadius: 19))
                         VStack(alignment: .leading, spacing: 6) {
                             Text("MINECRAFT SERVER").font(.system(size: 19, weight: .bold, design: .monospaced)).foregroundStyle(.cyan)
                             Text("Chocolate Edition").font(.system(size: 39, weight: .bold, design: .rounded)).foregroundStyle(.white)
@@ -177,7 +215,7 @@ struct ContentView: View {
                         Label(model.metrics?.server_rss_mib.map { String(format: "RAM %.0f MiB", $0) } ?? "RAM —", systemImage: "memorychip.fill").foregroundStyle(.cyan)
                         Label(model.metrics.map { String(format: "Disco libre %.1f GiB", $0.free_disk_gib) } ?? "Disco —", systemImage: "internaldrive.fill").foregroundStyle(.orange)
                         Spacer()
-                        Button("Abrir log completo", action: model.openLog).foregroundStyle(.purple)
+                        Button(model.loadingFullLog ? "Cargando log…" : "Ver log completo", action: model.loadFullSessionLog).foregroundStyle(.purple).disabled(model.loadingFullLog)
                     }.font(.system(size: 16, weight: .medium)).padding(.horizontal, 8)
 
                     VStack(alignment: .leading, spacing: 12) {
@@ -202,7 +240,10 @@ struct ContentView: View {
                     }.padding(17).background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 16))
 
                     VStack(alignment: .leading, spacing: 10) {
-                        Label("CONSOLA RECIENTE", systemImage: "text.alignleft").font(.system(size: 18, weight: .bold, design: .monospaced)).foregroundStyle(.cyan)
+                        HStack {
+                            Label("CONSOLA RECIENTE", systemImage: "text.alignleft").font(.system(size: 18, weight: .bold, design: .monospaced)).foregroundStyle(.cyan)
+                            Spacer(); Button("Limpiar", action: model.clearRecentConsole).foregroundStyle(.orange)
+                        }
                         ScrollView { VStack(alignment: .leading, spacing: 5) { ForEach(model.console.split(separator: "\n", omittingEmptySubsequences: false).map(String.init), id: \.self) { line in Text(line).font(.system(size: 16.5, design: .monospaced)).foregroundStyle(consoleColour(line)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) } } }
                             .padding(14).frame(height: 335).background(Color.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 13))
                     }
@@ -215,6 +256,7 @@ struct ContentView: View {
         } message: {
             Text("/\(model.commandInput) puede cambiar el estado del servidor o de los jugadores.")
         }
+        .sheet(isPresented: $model.showFullLog) { FullLogView(content: model.fullSessionLog) { model.showFullLog = false } }
     }
 }
 
