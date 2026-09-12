@@ -108,6 +108,12 @@ private func ageText(_ seconds: Int) -> String {
     if seconds < 86_400 { return "hace \(seconds / 3600)h" }
     return "hace \(seconds / 86_400)d"
 }
+private func requiresCommandConfirmation(_ command: String) -> Bool {
+    let value = command.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    let dangerous = ["stop", "op ", "deop ", "ban ", "ban-ip ", "pardon ", "kick ",
+                     "whitelist", "difficulty", "gamerule", "worldborder", "forceload", "save-off", "save-on", "reload"]
+    return dangerous.contains { value == $0 || value.hasPrefix($0) }
+}
 
 struct PlayerCard: View {
     let name: String
@@ -124,6 +130,11 @@ struct PlayerCard: View {
 
 struct ContentView: View {
     @StateObject private var model = ServerModel()
+    @State private var showCommandConfirmation = false
+    private func submitCommand() {
+        if requiresCommandConfirmation(model.commandInput) { showCommandConfirmation = true }
+        else { model.sendCommand() }
+    }
     var body: some View {
         ZStack {
             LinearGradient(colors: [Color(red: 0.025, green: 0.045, blue: 0.06), Color(red: 0.045, green: 0.075, blue: 0.055)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
@@ -184,8 +195,8 @@ struct ContentView: View {
                         Label("COMANDO DE CONSOLA", systemImage: "terminal.fill").font(.system(size: 18, weight: .bold, design: .monospaced)).foregroundStyle(.yellow)
                         HStack {
                             Text("/").font(.system(size: 23, weight: .bold, design: .monospaced)).foregroundStyle(.cyan)
-                            TextField("say Hola desde el panel", text: $model.commandInput).font(.system(size: 19, design: .monospaced)).textFieldStyle(.plain).onSubmit(model.sendCommand).disabled(!model.running || model.busy)
-                            Button("EJECUTAR", action: model.sendCommand).font(.system(size: 17, weight: .bold)).buttonStyle(.borderedProminent).tint(.purple).disabled(!model.running || model.busy || model.commandInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            TextField("say Hola desde el panel", text: $model.commandInput).font(.system(size: 19, design: .monospaced)).textFieldStyle(.plain).onSubmit(submitCommand).disabled(!model.running || model.busy)
+                            Button("EJECUTAR", action: submitCommand).font(.system(size: 17, weight: .bold)).buttonStyle(.borderedProminent).tint(.purple).disabled(!model.running || model.busy || model.commandInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }.padding(13).background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 11))
                         if !model.commandOutput.isEmpty { Text(model.commandOutput).font(.system(size: 16, design: .monospaced)).foregroundStyle(.mint).textSelection(.enabled) }
                     }.padding(17).background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 16))
@@ -198,6 +209,12 @@ struct ContentView: View {
                 }.padding(32).frame(minWidth: 880, minHeight: 920)
             }
         }.preferredColorScheme(.dark)
+        .alert("¿Ejecutar comando peligroso?", isPresented: $showCommandConfirmation) {
+            Button("Cancelar", role: .cancel) { }
+            Button("Ejecutar", role: .destructive) { model.sendCommand() }
+        } message: {
+            Text("/\(model.commandInput) puede cambiar el estado del servidor o de los jugadores.")
+        }
     }
 }
 
