@@ -26,12 +26,24 @@ else:
     DEFAULT_RUNTIME = Path.home() / ".local/share/minecraft-server-runtime"
 RUNTIME = Path(os.environ.get("MC_RUNTIME_ROOT", DEFAULT_RUNTIME)).expanduser().resolve()
 
+# The dashboard deliberately uses ordinary ANSI colours: it works in macOS
+# Terminal, iTerm2 and VS Code's terminal without a GUI dependency.  NO_COLOR=1
+# is useful for logs, pipes and accessibility tools.
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+PALETTE = {
+    "reset": "\033[0m", "muted": "\033[38;5;245m", "cyan": "\033[38;5;51m",
+    "green": "\033[38;5;46m", "yellow": "\033[38;5;226m", "red": "\033[38;5;203m",
+    "purple": "\033[38;5;141m", "bold": "\033[1m",
+}
+def colour(text, name):
+    return f"{PALETTE[name]}{text}{PALETTE['reset']}" if USE_COLOR else text
+
 def die(message):
-    print(f"ERROR: {message}", file=sys.stderr); raise SystemExit(1)
-def ok(message): print(f"[✓] {message}")
+    print(colour(f"ERROR: {message}", "red"), file=sys.stderr); raise SystemExit(1)
+def ok(message): print(f"{colour('[✓]', 'green')} {message}")
 def bad(message, fix=None):
-    print(f"[✗] {message}")
-    if fix: print(f"    Fix: {fix}")
+    print(f"{colour('[✗]', 'red')} {message}")
+    if fix: print(f"    {colour('Fix:', 'yellow')} {fix}")
 def load(path):
     try: return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc: die(f"invalid manifest {path}: {exc}")
@@ -191,6 +203,9 @@ def cmd_start(server):
     if not env["JAVA_HOME"]: die(f"Java {m['java_major']} is unavailable; run ./mc bootstrap java")
     env["PATH"] = str(Path(env["JAVA_HOME"]) / "bin") + os.pathsep + env["PATH"]
     with (log/"console.log").open("ab") as out:
+        # Readiness is checked only after this byte offset, never against an
+        # old successful launch recorded in a reused log.
+        (state(server) / "start-log-offset").write_text(str(out.tell()))
         proc=subprocess.Popen(["bash",str(launcher)],cwd=sd,stdout=out,stderr=subprocess.STDOUT,env=env,start_new_session=True)
     pid.write_text(str(proc.pid)); ok(f"started {server} (pid {proc.pid})")
 def cmd_stop(server):
@@ -203,6 +218,61 @@ def cmd_stop(server):
     die(f"{server} did not stop in 30 seconds; inspect logs before escalating")
 def cmd_status(server):
     m=manifest(server); print(f"{server}: {'RUNNING' if running(server) else 'STOPPED'} port={m['port']} runtime={runtime(server)}")
+def server_ready(server):
+    """Whether the current start attempt reached Minecraft's ready message."""
+    log = runtime(server) / "logs" / "console.log"
+    offset_path = state(server) / "start-log-offset"
+    try:
+        offset = int(offset_path.read_text()) if offset_path.exists() else 0
+        with log.open("rb") as handle:
+            handle.seek(offset)
+            output = handle.read().decode(errors="replace")
+        return "Done (" in output and "For help, type \"help\"" in output
+    except (OSError, ValueError):
+        return False
+def cmd_wait_ready(server, timeout=180):
+    if not running(server): die(f"{server} is not running")
+    deadline = time.monotonic() + timeout
+    print(f"Waiting for {server} to finish starting", end="", flush=True)
+    while time.monotonic() < deadline:
+        if server_ready(server):
+            print(); ok(f"{server} is ready to accept Minecraft connections"); return
+        if not running(server):
+            print(); die(f"{server} exited before it became ready; inspect {runtime(server) / 'logs' / 'console.log'}")
+        print(".", end="", flush=True); time.sleep(2)
+    print(); die(f"{server} did not become ready within {timeout} seconds; inspect its console log")
+def cmd_toggle(server):
+    """A deliberately serialized power switch for human operation."""
+    if running(server):
+        print(colour(f"Turning {server} off gracefully…", "yellow"))
+        cmd_stop(server)
+    else:
+        print(colour(f"Turning {server} on and waiting until it is ready…", "cyan"))
+        cmd_start(server)
+        cmd_wait_ready(server)
+def cmd_dashboard(server):
+    m = manifest(server)
+    active = running(server)
+    idle = pid_running(idle_pause_pid(server))
+    health = colour("● ONLINE", "green") if active else colour("● OFFLINE", "red")
+    title = colour("MINECRAFT CONTROL PANEL", "bold") + " " + colour(m["name"], "purple")
+    print()
+    print(colour("╭──────────────────────────────────────────────────────────────╮", "cyan"))
+    print(f"{colour('│', 'cyan')} {title}")
+    print(colour("├──────────────────────────────────────────────────────────────┤", "cyan"))
+    print(f"{colour('│', 'cyan')} Estado       {health}")
+    print(f"{colour('│', 'cyan')} Juego        Minecraft {m['minecraft_version']} · {m['loader']} {m['loader_version']}")
+    print(f"{colour('│', 'cyan')} Recursos     Java {m['java_major']} · Xms {m['memory_min_mib']//1024} GiB · Xmx {m['memory_max_mib']//1024} GiB")
+    print(f"{colour('│', 'cyan')} Red          LAN {m['port']} · RCON local {m['rcon_port']} (nunca exponer)")
+    print(f"{colour('│', 'cyan')} Mundo        semilla {m.get('seed', 'sin fijar')}")
+    print(f"{colour('│', 'cyan')} Pausa idle   {colour('activa (solo ciclo día/noche)', 'green') if idle else colour('inactiva', 'yellow')}")
+    print(colour("├──────────────────────────────────────────────────────────────┤", "cyan"))
+    action = "./mc toggle chocolate-edition"
+    print(f"{colour('│', 'cyan')} Interruptor  {colour(action, 'yellow')}")
+    print(f"{colour('│', 'cyan')} Operación    ./mc status chocolate-edition  ·  ./mc backup chocolate-edition")
+    print(f"{colour('│', 'cyan')} Consola      tail -f {runtime(server) / 'logs' / 'console.log'}")
+    print(colour("╰──────────────────────────────────────────────────────────────╯", "cyan"))
+    print()
 def cmd_doctor(server):
     m=manifest(server); healthy=True
     if current_platform() in m["platforms"]: ok(f"platform {current_platform()}")
@@ -342,7 +412,7 @@ def cmd_service(action, server):
     plist.parent.mkdir(parents=True,exist_ok=True)
     plist.write_text(f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{ROOT/'mc'}</string><string>start</string><string>{server}</string></array><key>RunAtLoad</key><true/></dict></plist>''')
     run(["launchctl","bootstrap",f"gui/{os.getuid()}",str(plist)]); ok(f"installed {plist}")
-def usage(): print("usage: ./mc {bootstrap|list|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op|idle-pause} [ID|--all]")
+def usage(): print("usage: ./mc {bootstrap|list|dashboard|toggle|wait-ready|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op|idle-pause} [ID|--all]")
 def main():
     args=sys.argv[1:]
     if not args or args[0] in ("help","--help","-h"): usage(); return
@@ -368,6 +438,15 @@ def main():
     if cmd=="_idle-monitor":
         if len(args)!=1: die("internal idle monitor requires ID")
         cmd_idle_monitor(args[0]); return
+    if cmd=="dashboard":
+        if len(args)!=1: die("usage: ./mc dashboard ID")
+        cmd_dashboard(args[0]); return
+    if cmd=="toggle":
+        if len(args)!=1: die("usage: ./mc toggle ID")
+        cmd_toggle(args[0]); return
+    if cmd=="wait-ready":
+        if len(args)!=1: die("usage: ./mc wait-ready ID")
+        cmd_wait_ready(args[0]); return
     if not args: die(f"usage: ./mc {cmd} ID|--all")
     for server in targets(args[0]):
         if cmd in ("deploy","install"): cmd_deploy(server)
