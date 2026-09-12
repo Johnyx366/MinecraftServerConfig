@@ -105,6 +105,12 @@ def java_home(required):
     if platform.system() == "Darwin":
         found = subprocess.run(["/usr/libexec/java_home", "-v", str(required)], text=True, capture_output=True)
         if found.returncode == 0: return found.stdout.strip()
+        # Homebrew's OpenJDK formula is often intentionally unregistered with
+        # macOS. Finder/LaunchServices also lacks Homebrew in PATH, so inspect
+        # the standard prefixes directly before relying on `brew --prefix`.
+        for prefix in (Path("/opt/homebrew"), Path("/usr/local")):
+            candidate = prefix / "opt" / f"openjdk@{required}" / "libexec/openjdk.jdk/Contents/Home"
+            if (candidate / "bin/java").exists(): return str(candidate)
         brew = shutil.which("brew")
         if brew and required == 17:
             prefix = subprocess.run([brew, "--prefix", "openjdk@17"], text=True, capture_output=True)
