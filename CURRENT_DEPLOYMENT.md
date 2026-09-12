@@ -22,7 +22,7 @@ This is the human-readable record of the first real deployment. It contains no p
 - Local encrypted restic repository: `~/MinecraftBackups/restic-repository`.
 - Password file: `~/MinecraftBackups/restic-password`, mode 0600; neither content nor path belongs in Git configuration.
 - GUI/CLI local references: `~/.config/minecraft-server-control/restic.env`, mode 0600; it stores only paths, not the password.
-- Reset safety points: `54f48efb` (pre-reset world) and `0ef18554` (new seeded world), both verified when created.
+- Reset safety points: `54f48efb` (pre-reset world) and `0ef18554` (new seeded world), both verified when created. Latest verified routine snapshot: `349fe72f` (2026-09-12 16:10 CDT).
 - The pre-reset world remains retained under `world.before-reset-20260912T214448Z` until independent offsite recovery is verified.
 
 ## LAN and routing
