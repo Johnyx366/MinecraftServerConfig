@@ -11,3 +11,4 @@ restic/
 *.jar
 __pycache__/
 dist/
+app/build/

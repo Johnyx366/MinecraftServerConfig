@@ -273,6 +273,55 @@ def cmd_dashboard(server):
     print(f"{colour('│', 'cyan')} Consola      tail -f {runtime(server) / 'logs' / 'console.log'}")
     print(colour("╰──────────────────────────────────────────────────────────────╯", "cyan"))
     print()
+def cmd_app(action, server):
+    """Build the small native macOS operator app from versioned Swift source."""
+    if action != "install": die("usage: ./mc app install ID")
+    if platform.system() != "Darwin": die("the native operator app is macOS-only")
+    source = ROOT / "app" / "MinecraftServerControl.swift"
+    icon = ROOT / "app" / "assets" / "creeper-control-icon.png"
+    for tool in ("swiftc", "sips", "iconutil"):
+        if not command_exists(tool): die(f"{tool} is required to build the app; install Xcode Command Line Tools, then rerun")
+    if not source.exists() or not icon.exists(): die("native app source or icon asset is missing from this checkout")
+    app = Path.home() / "Applications" / "Minecraft Server Control.app"
+    staging = Path.home() / "Applications" / "Minecraft Server Control.app.new"
+    app.parent.mkdir(parents=True, exist_ok=True)
+    if staging.exists(): shutil.rmtree(staging)
+    contents = staging / "Contents"; macos = contents / "MacOS"; resources = contents / "Resources"
+    macos.mkdir(parents=True); resources.mkdir()
+    info = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>MinecraftServerControl</string>
+<key>CFBundleIdentifier</key><string>local.minecraft.server-control</string>
+<key>CFBundleName</key><string>Minecraft Server Control</string>
+<key>CFBundleDisplayName</key><string>Minecraft Server Control</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+</dict></plist>
+'''
+    (contents / "Info.plist").write_text(info)
+    (resources / "mc-config.path").write_text(str(ROOT) + "\n")
+    (resources / "server-id.txt").write_text(server + "\n")
+    iconset = resources / "AppIcon.iconset"; iconset.mkdir()
+    sizes = [(16, "icon_16x16.png"), (32, "icon_16x16@2x.png"), (32, "icon_32x32.png"),
+             (64, "icon_32x32@2x.png"), (128, "icon_128x128.png"), (256, "icon_128x128@2x.png"),
+             (256, "icon_256x256.png"), (512, "icon_256x256@2x.png"), (512, "icon_512x512.png"),
+             (1024, "icon_512x512@2x.png")]
+    for pixels, filename in sizes:
+        run(["sips", "-z", str(pixels), str(pixels), str(icon), "--out", str(iconset / filename)], capture_output=True)
+    run(["iconutil", "-c", "icns", str(iconset), "-o", str(resources / "AppIcon.icns")], capture_output=True)
+    shutil.rmtree(iconset)
+    try:
+        run(["swiftc", "-parse-as-library", "-target", "arm64-apple-macos13.0", str(source), "-o", str(macos / "MinecraftServerControl")], capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "Swift compilation failed").strip()
+        die(detail)
+    (macos / "MinecraftServerControl").chmod(0o755)
+    if app.exists(): shutil.rmtree(app)
+    staging.rename(app)
+    run(["open", str(app)])
+    ok(f"native app installed and opened: {app}")
 def cmd_doctor(server):
     m=manifest(server); healthy=True
     if current_platform() in m["platforms"]: ok(f"platform {current_platform()}")
@@ -412,7 +461,7 @@ def cmd_service(action, server):
     plist.parent.mkdir(parents=True,exist_ok=True)
     plist.write_text(f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{ROOT/'mc'}</string><string>start</string><string>{server}</string></array><key>RunAtLoad</key><true/></dict></plist>''')
     run(["launchctl","bootstrap",f"gui/{os.getuid()}",str(plist)]); ok(f"installed {plist}")
-def usage(): print("usage: ./mc {bootstrap|list|dashboard|toggle|wait-ready|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op|idle-pause} [ID|--all]")
+def usage(): print("usage: ./mc {bootstrap|list|dashboard|app|toggle|wait-ready|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op|idle-pause} [ID|--all]")
 def main():
     args=sys.argv[1:]
     if not args or args[0] in ("help","--help","-h"): usage(); return
@@ -441,6 +490,9 @@ def main():
     if cmd=="dashboard":
         if len(args)!=1: die("usage: ./mc dashboard ID")
         cmd_dashboard(args[0]); return
+    if cmd=="app":
+        if len(args)!=2: die("usage: ./mc app install ID")
+        cmd_app(*args); return
     if cmd=="toggle":
         if len(args)!=1: die("usage: ./mc toggle ID")
         cmd_toggle(args[0]); return
