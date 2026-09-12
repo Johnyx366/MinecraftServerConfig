@@ -13,4 +13,4 @@ On macOS, runtime defaults to `~/MinecraftServerRuntime`; this path intentionall
 
 On macOS ARM64, install Homebrew once if absent, then bootstrap installs native OpenJDK 17 and restic. The first Chocolate deployment requires the official server-pack ZIP and its reviewed SHA-256; see its README. Set `MC_RESTIC_REPOSITORY` and `RESTIC_PASSWORD_FILE` outside Git before backups.
 
-Read [architecture](ARCHITECTURE.md), [operations](OPERATIONS.md), [backups](BACKUP.md), [security](SECURITY.md), [networking](NETWORKING.md), and [migration](MIGRATION.md). `./mc help` is the command reference.
+Read [architecture](ARCHITECTURE.md), [operations](OPERATIONS.md), [backups](BACKUP.md), [security](SECURITY.md), [networking](NETWORKING.md), [current deployment](CURRENT_DEPLOYMENT.md), [pending improvements](PENDING.md), and [migration](MIGRATION.md). `./mc help` is the command reference.

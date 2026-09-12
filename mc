@@ -25,6 +25,29 @@ if platform.system() == "Darwin":
 else:
     DEFAULT_RUNTIME = Path.home() / ".local/share/minecraft-server-runtime"
 RUNTIME = Path(os.environ.get("MC_RUNTIME_ROOT", DEFAULT_RUNTIME)).expanduser().resolve()
+OPERATOR_CONFIG = Path.home() / ".config" / "minecraft-server-control" / "restic.env"
+
+def load_operator_config():
+    """Load non-secret restic references for GUI launches that lack shell env."""
+    try:
+        for line in OPERATOR_CONFIG.read_text().splitlines():
+            if "=" not in line or line.lstrip().startswith("#"): continue
+            key, value = line.split("=", 1)
+            if key in ("MC_RESTIC_REPOSITORY", "RESTIC_PASSWORD_FILE") and key not in os.environ:
+                os.environ[key] = os.path.expanduser(value)
+    except OSError:
+        pass
+def ensure_initial_local_backup_config():
+    """Record only pointers to the known local repository, never its password."""
+    if OPERATOR_CONFIG.exists(): return
+    repository = Path.home() / "MinecraftBackups" / "restic-repository"
+    password = Path.home() / "MinecraftBackups" / "restic-password"
+    if not repository.exists() or not password.exists(): return
+    OPERATOR_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    OPERATOR_CONFIG.write_text(f"# Local operator configuration; no secret is stored here.\nMC_RESTIC_REPOSITORY={repository}\nRESTIC_PASSWORD_FILE={password}\n")
+    OPERATOR_CONFIG.chmod(0o600)
+    load_operator_config()
+load_operator_config()
 
 # The dashboard deliberately uses ordinary ANSI colours: it works in macOS
 # Terminal, iTerm2 and VS Code's terminal without a GUI dependency.  NO_COLOR=1
@@ -277,6 +300,7 @@ def cmd_app(action, server):
     """Build the small native macOS operator app from versioned Swift source."""
     if action != "install": die("usage: ./mc app install ID")
     if platform.system() != "Darwin": die("the native operator app is macOS-only")
+    ensure_initial_local_backup_config()
     source = ROOT / "app" / "MinecraftServerControl.swift"
     icon = ROOT / "app" / "assets" / "creeper-control-icon.png"
     for tool in ("swiftc", "sips", "iconutil"):
@@ -392,6 +416,39 @@ def cmd_backup(server):
         if paused:
             try: rcon_command(server, "save-on")
             except Exception as exc: print(f"WARNING: could not re-enable saving: {exc}", file=sys.stderr)
+def cmd_backup_status(server, as_json=False):
+    """Fast status only; integrity checks remain part of an actual backup."""
+    result = {"configured": bool(os.environ.get("MC_RESTIC_REPOSITORY")), "reachable": False, "snapshot": None}
+    if result["configured"] and command_exists("restic"):
+        env = os.environ.copy(); env["RESTIC_REPOSITORY"] = env["MC_RESTIC_REPOSITORY"]
+        query = subprocess.run(["restic", "snapshots", "--tag", f"server:{server}", "--json"], text=True, capture_output=True, env=env)
+        if query.returncode == 0:
+            snapshots = json.loads(query.stdout)
+            result["reachable"] = True
+            if snapshots:
+                latest = max(snapshots, key=lambda item: item.get("time", ""))
+                created = dt.datetime.fromisoformat(latest["time"].replace("Z", "+00:00"))
+                result["snapshot"] = {"id": latest.get("short_id", latest["id"][:8]), "time": latest["time"],
+                                      "age_seconds": max(0, int((dt.datetime.now(dt.timezone.utc) - created).total_seconds())),
+                                      "world_size_mib": round(latest.get("summary", {}).get("total_bytes_processed", 0) / 1024**2, 1)}
+        else: result["error"] = query.stderr.strip()
+    if as_json: print(json.dumps(result))
+    elif not result["configured"]: print("Backup not configured")
+    elif not result["reachable"]: print("Backup repository unreachable")
+    elif not result["snapshot"]: print("No backup snapshot for this server")
+    else: print(f"Latest backup {result['snapshot']['id']} ({result['snapshot']['age_seconds']} seconds ago)")
+def cmd_metrics(server, as_json=False):
+    m = manifest(server); data = {"running": running(server), "host_ram_mib": memory_mib(),
+                                  "free_disk_gib": round(shutil.disk_usage(runtime(server)).free / 1024**3, 1),
+                                  "port": m["port"], "port_ready": not port_free(m["port"])}
+    if data["running"]:
+        pid = (state(server) / "server.pid").read_text().strip()
+        proc = subprocess.run(["ps", "-p", pid, "-o", "%cpu=", "-o", "rss="], text=True, capture_output=True)
+        parts = proc.stdout.split()
+        if len(parts) >= 2:
+            data["server_cpu_percent"] = float(parts[0]); data["server_rss_mib"] = round(int(parts[1]) / 1024, 1)
+    if as_json: print(json.dumps(data))
+    else: print(json.dumps(data, indent=2))
 def cmd_whitelist(action, server, player):
     if not running(server): die("server must be running to modify the whitelist")
     if action not in ("add", "remove"): die("usage: ./mc whitelist {add|remove} ID PLAYER")
@@ -480,7 +537,7 @@ def cmd_service(action, server):
     plist.parent.mkdir(parents=True,exist_ok=True)
     plist.write_text(f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{ROOT/'mc'}</string><string>start</string><string>{server}</string></array><key>RunAtLoad</key><true/></dict></plist>''')
     run(["launchctl","bootstrap",f"gui/{os.getuid()}",str(plist)]); ok(f"installed {plist}")
-def usage(): print("usage: ./mc {bootstrap|list|dashboard|app|toggle|wait-ready|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op|command|players|idle-pause} [ID|--all]")
+def usage(): print("usage: ./mc {bootstrap|list|dashboard|app|toggle|wait-ready|status|doctor|deploy|install|start|stop|restart|backup|backup-status|metrics|restore|checkpoint|service|whitelist|op|command|players|idle-pause} [ID|--all]")
 def main():
     args=sys.argv[1:]
     if not args or args[0] in ("help","--help","-h"): usage(); return
@@ -507,6 +564,10 @@ def main():
         if len(args) not in (1, 2) or (len(args) == 2 and args[1] != "--json"):
             die("usage: ./mc players ID [--json]")
         cmd_players(args[0], len(args) == 2); return
+    if cmd in ("backup-status", "metrics"):
+        if len(args) not in (1, 2) or (len(args) == 2 and args[1] != "--json"):
+            die(f"usage: ./mc {cmd} ID [--json]")
+        (cmd_backup_status if cmd == "backup-status" else cmd_metrics)(args[0], len(args) == 2); return
     if cmd=="idle-pause":
         if len(args)!=2: die("usage: ./mc idle-pause {start|stop|status} ID")
         cmd_idle_pause(*args); return

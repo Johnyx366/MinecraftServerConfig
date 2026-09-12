@@ -3,6 +3,9 @@ import SwiftUI
 
 struct CommandResult { let status: Int32; let output: String }
 struct PlayerResponse: Decodable { let players: [String]; let count: Int; let maximum: Int; let rcon_latency_ms: Int }
+struct BackupSnapshot: Decodable { let id: String; let age_seconds: Int; let world_size_mib: Double }
+struct BackupResponse: Decodable { let configured: Bool; let reachable: Bool; let snapshot: BackupSnapshot? }
+struct MetricsResponse: Decodable { let running: Bool; let host_ram_mib: Int; let free_disk_gib: Double; let server_cpu_percent: Double?; let server_rss_mib: Double? }
 
 @MainActor
 final class ServerModel: ObservableObject {
@@ -15,6 +18,8 @@ final class ServerModel: ObservableObject {
     @Published var rconLatency: Int?
     @Published var commandInput = ""
     @Published var commandOutput = ""
+    @Published var backup: BackupResponse?
+    @Published var metrics: MetricsResponse?
     let serverID: String
     private let cli: URL
     private var timer: Timer?
@@ -36,6 +41,14 @@ final class ServerModel: ObservableObject {
         }
         let log = NSHomeDirectory() + "/MinecraftServerRuntime/" + serverID + "/logs/console.log"
         executeExternal("/usr/bin/tail", ["-n", "16", log]) { result in self.console = result.output.isEmpty ? "Aún no hay salida de consola." : result.output }
+        execute(["backup-status", serverID, "--json"]) { result in
+            guard let data = result.output.data(using: .utf8) else { return }
+            self.backup = try? JSONDecoder().decode(BackupResponse.self, from: data)
+        }
+        execute(["metrics", serverID, "--json"]) { result in
+            guard let data = result.output.data(using: .utf8) else { return }
+            self.metrics = try? JSONDecoder().decode(MetricsResponse.self, from: data)
+        }
     }
     func refreshPlayers() {
         execute(["players", serverID, "--json"]) { result in
@@ -58,6 +71,17 @@ final class ServerModel: ObservableObject {
             self.busy = false; self.commandOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines); self.commandInput = ""; self.refresh()
         }
     }
+    func backupNow() {
+        guard !busy else { return }; busy = true; message = "Creando backup consistente…"
+        execute(["backup", serverID]) { result in
+            self.busy = false; self.message = result.status == 0 ? "Backup verificado correctamente" : "Falló el backup; revisa la consola"
+            self.commandOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines); self.refresh()
+        }
+    }
+    func openLog() {
+        let log = NSHomeDirectory() + "/MinecraftServerRuntime/" + serverID + "/logs/console.log"
+        executeExternal("/usr/bin/open", [log]) { _ in }
+    }
     private func execute(_ arguments: [String], completion: @escaping (CommandResult) -> Void) { executeExternal(cli.path, arguments, completion: completion) }
     private func executeExternal(_ executable: String, _ arguments: [String], completion: @escaping (CommandResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -77,6 +101,12 @@ private func consoleColour(_ line: String) -> Color {
     if line.localizedCaseInsensitiveContains("warn") || line.localizedCaseInsensitiveContains("timeout") { return .yellow }
     if line.localizedCaseInsensitiveContains("info") { return .cyan }
     return Color(red: 0.57, green: 1, blue: 0.68)
+}
+private func ageText(_ seconds: Int) -> String {
+    if seconds < 60 { return "hace \(seconds)s" }
+    if seconds < 3600 { return "hace \(seconds / 60)m" }
+    if seconds < 86_400 { return "hace \(seconds / 3600)h" }
+    return "hace \(seconds / 86_400)d"
 }
 
 struct PlayerCard: View {
@@ -118,6 +148,26 @@ struct ContentView: View {
                     }.buttonStyle(.borderedProminent).tint(model.running ? .red : .green).disabled(model.busy)
                     HStack { Label("Apagado limpio: nunca se fuerza Java.", systemImage: "lock.shield.fill"); Spacer(); Button("↻ Actualizar", action: model.refresh).disabled(model.busy) }
                         .font(.system(size: 16, weight: .medium)).foregroundStyle(.yellow)
+
+                    HStack(alignment: .top, spacing: 15) {
+                        VStack(alignment: .leading, spacing: 9) {
+                            Label("BACKUP", systemImage: "externaldrive.fill.badge.checkmark").font(.system(size: 18, weight: .bold, design: .monospaced)).foregroundStyle(.mint)
+                            if let backup = model.backup, backup.reachable, let snapshot = backup.snapshot {
+                                Text("\(snapshot.id) · \(ageText(snapshot.age_seconds)) · mundo \(snapshot.world_size_mib, specifier: "%.1f") MiB").font(.system(size: 16, weight: .medium)).foregroundStyle(.white)
+                            } else if model.backup?.configured == true { Text("Repositorio no alcanzable o sin snapshot.").font(.system(size: 16)).foregroundStyle(.red) }
+                            else { Text("Backup aún no configurado.").font(.system(size: 16)).foregroundStyle(.orange) }
+                        }
+                        Spacer()
+                        Button("BACKUP AHORA", action: model.backupNow).font(.system(size: 17, weight: .bold)).buttonStyle(.borderedProminent).tint(.blue).disabled(model.busy)
+                    }.padding(17).background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 16))
+
+                    HStack(spacing: 18) {
+                        Label(model.metrics?.server_cpu_percent.map { String(format: "Java CPU %.1f%%", $0) } ?? "Java detenido", systemImage: "cpu.fill").foregroundStyle(.pink)
+                        Label(model.metrics?.server_rss_mib.map { String(format: "RAM %.0f MiB", $0) } ?? "RAM —", systemImage: "memorychip.fill").foregroundStyle(.cyan)
+                        Label(model.metrics.map { String(format: "Disco libre %.1f GiB", $0.free_disk_gib) } ?? "Disco —", systemImage: "internaldrive.fill").foregroundStyle(.orange)
+                        Spacer()
+                        Button("Abrir log completo", action: model.openLog).foregroundStyle(.purple)
+                    }.font(.system(size: 16, weight: .medium)).padding(.horizontal, 8)
 
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
