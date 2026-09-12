@@ -320,7 +320,7 @@ def cmd_app(action, server):
     (macos / "MinecraftServerControl").chmod(0o755)
     if app.exists(): shutil.rmtree(app)
     staging.rename(app)
-    run(["open", str(app)])
+    run(["open", "-n", str(app)])
     ok(f"native app installed and opened: {app}")
 def cmd_doctor(server):
     m=manifest(server); healthy=True
@@ -401,6 +401,25 @@ def cmd_op(server, player):
     if not running(server): die("server must be running to grant OP")
     rcon_command(server, f"op {player}")
     ok(f"OP granted: {player}")
+def cmd_command(server, command):
+    """Run an explicit operator command through loopback-only RCON."""
+    if not running(server): die("server must be running to send a command")
+    if not command.strip(): die("command cannot be empty")
+    response = rcon_command(server, command)
+    print(response.strip() or "Command sent.")
+def cmd_players(server, as_json=False):
+    """Return the vanilla player list and local RCON round-trip latency."""
+    if not running(server): die("server must be running to query players")
+    started = time.monotonic()
+    response = rcon_command(server, "list").strip()
+    latency = round((time.monotonic() - started) * 1000)
+    match = re.search(r"There are (\d+) of a max of (\d+) players online:\s*(.*)", response, re.DOTALL)
+    if not match: die(f"could not parse the server player list: {response!r}")
+    count, maximum, names = int(match.group(1)), int(match.group(2)), match.group(3).strip()
+    players = [] if not names else [name.strip() for name in names.split(",") if name.strip()]
+    result = {"players": players, "count": count, "maximum": maximum, "rcon_latency_ms": latency}
+    if as_json: print(json.dumps(result))
+    else: print(f"{count}/{maximum} online: {', '.join(players) if players else 'nobody'} (local RCON {latency} ms)")
 def idle_pause_pid(server): return state(server) / "idle-pause.pid"
 def cmd_idle_pause(action, server):
     pid = idle_pause_pid(server)
@@ -461,7 +480,7 @@ def cmd_service(action, server):
     plist.parent.mkdir(parents=True,exist_ok=True)
     plist.write_text(f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{ROOT/'mc'}</string><string>start</string><string>{server}</string></array><key>RunAtLoad</key><true/></dict></plist>''')
     run(["launchctl","bootstrap",f"gui/{os.getuid()}",str(plist)]); ok(f"installed {plist}")
-def usage(): print("usage: ./mc {bootstrap|list|dashboard|app|toggle|wait-ready|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op|idle-pause} [ID|--all]")
+def usage(): print("usage: ./mc {bootstrap|list|dashboard|app|toggle|wait-ready|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op|command|players|idle-pause} [ID|--all]")
 def main():
     args=sys.argv[1:]
     if not args or args[0] in ("help","--help","-h"): usage(); return
@@ -481,6 +500,13 @@ def main():
     if cmd=="op":
         if len(args)!=2: die("usage: ./mc op ID PLAYER")
         cmd_op(*args); return
+    if cmd=="command":
+        if len(args)<2: die("usage: ./mc command ID 'SERVER COMMAND'")
+        cmd_command(args[0], " ".join(args[1:])); return
+    if cmd=="players":
+        if len(args) not in (1, 2) or (len(args) == 2 and args[1] != "--json"):
+            die("usage: ./mc players ID [--json]")
+        cmd_players(args[0], len(args) == 2); return
     if cmd=="idle-pause":
         if len(args)!=2: die("usage: ./mc idle-pause {start|stop|status} ID")
         cmd_idle_pause(*args); return

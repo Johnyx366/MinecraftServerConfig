@@ -1,10 +1,8 @@
 import AppKit
 import SwiftUI
 
-struct CommandResult {
-    let status: Int32
-    let output: String
-}
+struct CommandResult { let status: Int32; let output: String }
+struct PlayerResponse: Decodable { let players: [String]; let count: Int; let maximum: Int; let rcon_latency_ms: Int }
 
 @MainActor
 final class ServerModel: ObservableObject {
@@ -12,152 +10,148 @@ final class ServerModel: ObservableObject {
     @Published var busy = false
     @Published var message = "Leyendo estado…"
     @Published var console = ""
-
+    @Published var players: [String] = []
+    @Published var playerLimit = 0
+    @Published var rconLatency: Int?
+    @Published var commandInput = ""
+    @Published var commandOutput = ""
     let serverID: String
     private let cli: URL
     private var timer: Timer?
 
     init() {
-        let resourceRoot = Bundle.main.resourceURL!
-        let pointer = resourceRoot.appendingPathComponent("mc-config.path")
-        let root = (try? String(contentsOf: pointer, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
-        self.cli = URL(fileURLWithPath: root).appendingPathComponent("mc")
-        self.serverID = (try? String(contentsOf: resourceRoot.appendingPathComponent("server-id.txt"), encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "chocolate-edition"
+        let resources = Bundle.main.resourceURL!
+        let root = (try? String(contentsOf: resources.appendingPathComponent("mc-config.path"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
+        cli = URL(fileURLWithPath: root).appendingPathComponent("mc")
+        serverID = (try? String(contentsOf: resources.appendingPathComponent("server-id.txt"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? "chocolate-edition"
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
+        timer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in Task { @MainActor in self?.refresh() } }
     }
-
     deinit { timer?.invalidate() }
-
     func refresh() {
         execute(["status", serverID]) { result in
             self.running = result.output.contains("RUNNING")
             self.message = self.running ? "Servidor listo" : "Servidor apagado"
+            if self.running { self.refreshPlayers() } else { self.players = []; self.rconLatency = nil }
         }
         let log = NSHomeDirectory() + "/MinecraftServerRuntime/" + serverID + "/logs/console.log"
-        executeExternal("/usr/bin/tail", ["-n", "14", log]) { result in
-            self.console = result.output.isEmpty ? "Aún no hay salida de consola." : result.output
+        executeExternal("/usr/bin/tail", ["-n", "16", log]) { result in self.console = result.output.isEmpty ? "Aún no hay salida de consola." : result.output }
+    }
+    func refreshPlayers() {
+        execute(["players", serverID, "--json"]) { result in
+            guard result.status == 0, let data = result.output.data(using: .utf8), let state = try? JSONDecoder().decode(PlayerResponse.self, from: data) else { return }
+            self.players = state.players; self.playerLimit = state.maximum; self.rconLatency = state.rcon_latency_ms
         }
     }
-
     func toggle() {
-        guard !busy else { return }
-        busy = true
+        guard !busy else { return }; busy = true
         message = running ? "Apagando de forma segura…" : "Iniciando y esperando a Minecraft…"
         execute(["toggle", serverID]) { result in
-            self.busy = false
-            if result.status == 0 {
-                self.running.toggle()
-                self.message = self.running ? "Servidor listo" : "Servidor apagado correctamente"
-            } else {
-                self.message = "La operación no terminó correctamente. Revisa la consola."
-            }
+            self.busy = false; self.message = result.status == 0 ? "Operación terminada correctamente" : "La operación no terminó correctamente. Revisa la consola."
             self.refresh()
         }
     }
-
-    private func execute(_ arguments: [String], completion: @escaping (CommandResult) -> Void) {
-        executeExternal(cli.path, arguments, completion: completion)
+    func sendCommand() {
+        let command = commandInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard running, !busy, !command.isEmpty else { return }; busy = true; commandOutput = "Enviando: /\(command)"
+        execute(["command", serverID, command]) { result in
+            self.busy = false; self.commandOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines); self.commandInput = ""; self.refresh()
+        }
     }
-
+    private func execute(_ arguments: [String], completion: @escaping (CommandResult) -> Void) { executeExternal(cli.path, arguments, completion: completion) }
     private func executeExternal(_ executable: String, _ arguments: [String], completion: @escaping (CommandResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = arguments
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
+            let process = Process(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
+            let pipe = Pipe(); process.standardOutput = pipe; process.standardError = pipe
             do {
-                try process.run()
-                process.waitUntilExit()
+                try process.run(); process.waitUntilExit()
                 let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                 DispatchQueue.main.async { completion(CommandResult(status: process.terminationStatus, output: output)) }
-            } catch {
-                DispatchQueue.main.async { completion(CommandResult(status: 1, output: error.localizedDescription)) }
-            }
+            } catch { DispatchQueue.main.async { completion(CommandResult(status: 1, output: error.localizedDescription)) } }
         }
+    }
+}
+
+private func consoleColour(_ line: String) -> Color {
+    if line.localizedCaseInsensitiveContains("error") || line.localizedCaseInsensitiveContains("exception") { return .red }
+    if line.localizedCaseInsensitiveContains("warn") || line.localizedCaseInsensitiveContains("timeout") { return .yellow }
+    if line.localizedCaseInsensitiveContains("info") { return .cyan }
+    return Color(red: 0.57, green: 1, blue: 0.68)
+}
+
+struct PlayerCard: View {
+    let name: String
+    private var headURL: URL? { URL(string: "https://mc-heads.net/avatar/\(name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name)/96") }
+    var body: some View {
+        HStack(spacing: 12) {
+            AsyncImage(url: headURL) { $0.resizable().interpolation(.none) } placeholder: { Image(systemName: "person.crop.square").resizable().padding(7).foregroundStyle(.purple) }
+                .frame(width: 45, height: 45).background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+            Text(name).font(.system(size: 18, weight: .bold, design: .rounded)).foregroundStyle(.white)
+            Spacer(); Image(systemName: "wifi").foregroundStyle(.green)
+        }.padding(11).background(Color(red: 0.08, green: 0.12, blue: 0.15), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
 struct ContentView: View {
     @StateObject private var model = ServerModel()
-
     var body: some View {
         ZStack {
-            Color(red: 0.035, green: 0.055, blue: 0.055).ignoresSafeArea()
-            VStack(spacing: 18) {
-                HStack(spacing: 14) {
-                    Image(nsImage: NSApp.applicationIconImage)
-                        .resizable().frame(width: 62, height: 62).clipShape(RoundedRectangle(cornerRadius: 14))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("MINECRAFT SERVER")
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            .foregroundStyle(.cyan)
-                        Text("Chocolate Edition")
-                            .font(.system(size: 26, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
-                        Text("Forge 1.19.2 · Java 17 · Puerto 25565")
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.secondary)
+            LinearGradient(colors: [Color(red: 0.025, green: 0.045, blue: 0.06), Color(red: 0.045, green: 0.075, blue: 0.055)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 25) {
+                    HStack(spacing: 18) {
+                        Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 84, height: 84).clipShape(RoundedRectangle(cornerRadius: 19))
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("MINECRAFT SERVER").font(.system(size: 19, weight: .bold, design: .monospaced)).foregroundStyle(.cyan)
+                            Text("Chocolate Edition").font(.system(size: 39, weight: .bold, design: .rounded)).foregroundStyle(.white)
+                            Text("Forge 1.19.2 · Java 17 · Puerto 25565").font(.system(size: 18, design: .monospaced)).foregroundStyle(.mint)
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 8) {
+                            Label(model.running ? "EN LÍNEA" : "APAGADO", systemImage: model.running ? "checkmark.circle.fill" : "power.circle.fill").font(.system(size: 19, weight: .bold)).foregroundStyle(model.running ? .green : .orange)
+                            Text(model.message).font(.system(size: 15)).foregroundStyle(.secondary)
+                        }
                     }
-                    Spacer()
-                    VStack(alignment: .trailing, spacing: 6) {
-                        Label(model.running ? "EN LÍNEA" : "APAGADO", systemImage: model.running ? "checkmark.circle.fill" : "power.circle.fill")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(model.running ? .green : .orange)
-                        Text(model.message).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
+                    Button(action: model.toggle) {
+                        HStack(spacing: 12) { Image(systemName: model.running ? "power" : "play.fill"); Text(model.busy ? "ESPERA…" : (model.running ? "APAGAR SERVIDOR" : "ENCENDER SERVIDOR")) }
+                            .font(.system(size: 24, weight: .bold, design: .rounded)).frame(maxWidth: .infinity).padding(.vertical, 19)
+                    }.buttonStyle(.borderedProminent).tint(model.running ? .red : .green).disabled(model.busy)
+                    HStack { Label("Apagado limpio: nunca se fuerza Java.", systemImage: "lock.shield.fill"); Spacer(); Button("↻ Actualizar", action: model.refresh).disabled(model.busy) }
+                        .font(.system(size: 16, weight: .medium)).foregroundStyle(.yellow)
 
-                Button(action: model.toggle) {
-                    HStack(spacing: 10) {
-                        Image(systemName: model.running ? "power" : "play.fill")
-                        Text(model.busy ? "ESPERA…" : (model.running ? "APAGAR SERVIDOR" : "ENCENDER SERVIDOR"))
-                    }
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
-                    .frame(maxWidth: .infinity).padding(.vertical, 15)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(model.running ? .red : .green)
-                .disabled(model.busy)
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Label("JUGADORES", systemImage: "person.2.fill").font(.system(size: 18, weight: .bold, design: .monospaced)).foregroundStyle(.purple)
+                            Text("\(model.players.count)/\(model.playerLimit)").font(.system(size: 18, weight: .bold)).foregroundStyle(.white)
+                            Spacer()
+                            Label(model.rconLatency.map { "RCON local \($0) ms" } ?? "RCON sin datos", systemImage: "bolt.horizontal.circle.fill").font(.system(size: 16, weight: .medium)).foregroundStyle(.orange)
+                        }
+                        if model.players.isEmpty { Text(model.running ? "No hay jugadores conectados." : "El servidor está apagado.").font(.system(size: 17)).foregroundStyle(.secondary).padding(.vertical, 10) }
+                        else { LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) { ForEach(model.players, id: \.self) { PlayerCard(name: $0) } } }
+                    }.padding(17).background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 16))
 
-                HStack {
-                    Label("El apagado es limpio; no se fuerza Java.", systemImage: "lock.shield.fill")
-                    Spacer()
-                    Button("Actualizar", action: model.refresh).disabled(model.busy)
-                }
-                .font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label("COMANDO DE CONSOLA", systemImage: "terminal.fill").font(.system(size: 18, weight: .bold, design: .monospaced)).foregroundStyle(.yellow)
+                        HStack {
+                            Text("/").font(.system(size: 23, weight: .bold, design: .monospaced)).foregroundStyle(.cyan)
+                            TextField("say Hola desde el panel", text: $model.commandInput).font(.system(size: 19, design: .monospaced)).textFieldStyle(.plain).onSubmit(model.sendCommand).disabled(!model.running || model.busy)
+                            Button("EJECUTAR", action: model.sendCommand).font(.system(size: 17, weight: .bold)).buttonStyle(.borderedProminent).tint(.purple).disabled(!model.running || model.busy || model.commandInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }.padding(13).background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 11))
+                        if !model.commandOutput.isEmpty { Text(model.commandOutput).font(.system(size: 16, design: .monospaced)).foregroundStyle(.mint).textSelection(.enabled) }
+                    }.padding(17).background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 16))
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("CONSOLA RECIENTE")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.cyan)
-                    ScrollView {
-                        Text(model.console)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(Color(red: 0.55, green: 1, blue: 0.68))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("CONSOLA RECIENTE", systemImage: "text.alignleft").font(.system(size: 18, weight: .bold, design: .monospaced)).foregroundStyle(.cyan)
+                        ScrollView { VStack(alignment: .leading, spacing: 5) { ForEach(model.console.split(separator: "\n", omittingEmptySubsequences: false).map(String.init), id: \.self) { line in Text(line).font(.system(size: 16.5, design: .monospaced)).foregroundStyle(consoleColour(line)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) } } }
+                            .padding(14).frame(height: 335).background(Color.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 13))
                     }
-                    .padding(12).frame(height: 175)
-                    .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-                }
+                }.padding(32).frame(minWidth: 880, minHeight: 920)
             }
-            .padding(26).frame(minWidth: 650, minHeight: 410)
-        }
-        .preferredColorScheme(.dark)
+        }.preferredColorScheme(.dark)
     }
 }
 
 @main
 struct MinecraftServerControlApp: App {
-    var body: some Scene {
-        WindowGroup("Minecraft Server Control") { ContentView() }
-            .windowResizability(.contentSize)
-    }
+    var body: some Scene { WindowGroup("Minecraft Server Control") { ContentView() }.windowResizability(.contentSize) }
 }
