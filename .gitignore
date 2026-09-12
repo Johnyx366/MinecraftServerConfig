@@ -1,0 +1,13 @@
+.DS_Store
+.env
+*.secret
+secrets/
+runtime/
+downloads/
+restic/
+*.log
+*.pid
+*.zip
+*.jar
+__pycache__/
+dist/
