@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import zipfile
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -159,7 +160,12 @@ def cmd_deploy(server):
         secret.write_text(secrets.token_urlsafe(32)); secret.chmod(0o600)
     set_properties(props, {"rcon.password": secret.read_text().strip()})
     variables = serverdir / "variables.txt"
-    if variables.exists(): set_shell_variables(variables, {"WAIT_FOR_USER_INPUT": "false", "RESTART": "false"})
+    if variables.exists():
+        variable_lines = variables.read_text().splitlines()
+        current_args = next((line.split("=", 1)[1] for line in variable_lines if line.startswith("JAVA_ARGS=")), '""')
+        current_args = re.sub(r"-Xms\d+[mMgG]", f"-Xms{m['memory_min_mib']}M", current_args)
+        current_args = re.sub(r"-Xmx\d+[mMgG]", f"-Xmx{m['memory_max_mib']}M", current_args)
+        set_shell_variables(variables, {"JAVA_ARGS": current_args, "WAIT_FOR_USER_INPUT": "false", "RESTART": "false"})
     launchers = [p.name for p in serverdir.glob("run.*") if p.is_file()] + [p.name for p in serverdir.glob("start*.sh")]
     (state(server) / "runtime.json").write_text(json.dumps({"deployed_at":dt.datetime.now(dt.timezone.utc).isoformat(), "pack_sha256":actual, "launchers":launchers}, indent=2)+"\n")
     print(f"Deployed {server}. Set eula=true in {eula} after accepting the EULA; then ./mc start {server}.")
@@ -224,20 +230,35 @@ def cmd_doctor(server):
 def restic(server, extra, cwd=None):
     if not os.environ.get("MC_RESTIC_REPOSITORY"): die("MC_RESTIC_REPOSITORY is not set")
     if not command_exists("restic"): die("restic not installed; run ./mc bootstrap")
-    run(["restic", *extra], cwd=cwd)
+    env = os.environ.copy()
+    env["RESTIC_REPOSITORY"] = env["MC_RESTIC_REPOSITORY"]
+    run(["restic", *extra], cwd=cwd, env=env)
 def rcon_command(server, command):
     """Issue one authenticated RCON command over loopback only."""
     m = manifest(server); password = (state(server) / "rcon-password").read_text().strip()
     def packet(request_id, kind, body):
         data = struct.pack("<ii", request_id, kind) + body.encode() + b"\0\0"
         return struct.pack("<i", len(data)) + data
+    def receive_exact(conn, size):
+        data = b""
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk: die("local RCON connection closed unexpectedly")
+            data += chunk
+        return data
+    def receive_packet(conn):
+        length = struct.unpack("<i", receive_exact(conn, 4))[0]
+        if length < 10 or length > 16 * 1024 * 1024: die("invalid local RCON response")
+        data = receive_exact(conn, length)
+        request_id, kind = struct.unpack("<ii", data[:8])
+        return request_id, kind, data[8:-2].decode(errors="replace")
     with socket.create_connection(("127.0.0.1", m["rcon_port"]), timeout=10) as conn:
         conn.sendall(packet(1, 3, password))
-        length = struct.unpack("<i", conn.recv(4))[0]
-        reply = conn.recv(length)
-        request_id = struct.unpack("<i", reply[:4])[0]
+        request_id, _, _ = receive_packet(conn)
         if request_id == -1: die("local RCON authentication failed; inspect runtime secret and server.properties")
         conn.sendall(packet(2, 2, command))
+        _, _, response = receive_packet(conn)
+        return response
 def cmd_backup(server):
     sd=runtime(server)/"server"; world=sd/"world"
     if not world.exists(): die(f"world missing: {world}")
@@ -261,6 +282,39 @@ def cmd_op(server, player):
     if not running(server): die("server must be running to grant OP")
     rcon_command(server, f"op {player}")
     ok(f"OP granted: {player}")
+def idle_pause_pid(server): return state(server) / "idle-pause.pid"
+def cmd_idle_pause(action, server):
+    pid = idle_pause_pid(server)
+    if action == "status":
+        print(f"idle-pause {server}: {'RUNNING' if pid_running(pid) else 'STOPPED'}")
+        return
+    if action == "stop":
+        if pid_running(pid): os.killpg(int(pid.read_text()), signal.SIGTERM)
+        pid.unlink(missing_ok=True); ok(f"idle pause stopped for {server}"); return
+    if action != "start": die("usage: ./mc idle-pause {start|stop|status} ID")
+    if not running(server): die("server must be running before idle pause can start")
+    if pid_running(pid): die(f"idle pause already running for {server}")
+    log = runtime(server) / "logs" / "idle-pause.log"
+    with log.open("ab") as out:
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_idle-monitor", server],
+                                stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    pid.write_text(str(proc.pid)); ok(f"idle pause started for {server}")
+def cmd_idle_monitor(server):
+    pid = idle_pause_pid(server)
+    last = None
+    try:
+        while running(server):
+            response = rcon_command(server, "list")
+            match = re.search(r"There are (\d+) of a max", response)
+            if not match: raise RuntimeError(f"unrecognised RCON player list: {response!r}")
+            enabled = "true" if int(match.group(1)) else "false"
+            if enabled != last:
+                rcon_command(server, f"gamerule doDaylightCycle {enabled}")
+                print(f"doDaylightCycle={enabled}", flush=True)
+                last = enabled
+            time.sleep(10)
+    finally:
+        pid.unlink(missing_ok=True)
 def cmd_restore(server, snapshot):
     if running(server): die("stop server before restore")
     sd=runtime(server)/"server"; world=sd/"world"
@@ -288,7 +342,7 @@ def cmd_service(action, server):
     plist.parent.mkdir(parents=True,exist_ok=True)
     plist.write_text(f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{ROOT/'mc'}</string><string>start</string><string>{server}</string></array><key>RunAtLoad</key><true/></dict></plist>''')
     run(["launchctl","bootstrap",f"gui/{os.getuid()}",str(plist)]); ok(f"installed {plist}")
-def usage(): print("usage: ./mc {bootstrap|list|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op} [ID|--all]")
+def usage(): print("usage: ./mc {bootstrap|list|status|doctor|deploy|install|start|stop|restart|backup|restore|checkpoint|service|whitelist|op|idle-pause} [ID|--all]")
 def main():
     args=sys.argv[1:]
     if not args or args[0] in ("help","--help","-h"): usage(); return
@@ -308,6 +362,12 @@ def main():
     if cmd=="op":
         if len(args)!=2: die("usage: ./mc op ID PLAYER")
         cmd_op(*args); return
+    if cmd=="idle-pause":
+        if len(args)!=2: die("usage: ./mc idle-pause {start|stop|status} ID")
+        cmd_idle_pause(*args); return
+    if cmd=="_idle-monitor":
+        if len(args)!=1: die("internal idle monitor requires ID")
+        cmd_idle_monitor(args[0]); return
     if not args: die(f"usage: ./mc {cmd} ID|--all")
     for server in targets(args[0]):
         if cmd in ("deploy","install"): cmd_deploy(server)
